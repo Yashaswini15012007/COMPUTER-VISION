@@ -55,7 +55,6 @@ st.markdown(
         border-right: 1px solid rgba(139, 92, 246, 0.22);
     }
 
-    /* Hero Banner */
     .studio-hero {
         background: linear-gradient(135deg, rgba(139, 92, 246, 0.18) 0%, rgba(56, 189, 248, 0.12) 100%);
         border: 1px solid rgba(139, 92, 246, 0.35);
@@ -94,7 +93,6 @@ st.markdown(
         line-height: 1.5;
     }
 
-    /* Glass Cards */
     .glass-card {
         background: rgba(17, 24, 45, 0.68);
         border: 1px solid rgba(148, 163, 184, 0.18);
@@ -122,7 +120,6 @@ st.markdown(
         margin-bottom: 0;
     }
 
-    /* Empty State */
     .empty-state {
         background: rgba(15, 23, 42, 0.55);
         border: 1.5px dashed rgba(139, 92, 246, 0.42);
@@ -143,7 +140,6 @@ st.markdown(
         font-size: 0.9rem;
     }
 
-    /* Animated Primary & Secondary Buttons */
     .stButton > button, .stDownloadButton > button {
         border-radius: 10px;
         font-weight: 600;
@@ -166,7 +162,6 @@ st.markdown(
         box-shadow: 0 8px 24px rgba(124, 58, 237, 0.45);
     }
 
-    /* Metric cards */
     div[data-testid="stMetric"] {
         background: rgba(17, 24, 45, 0.72);
         border: 1px solid rgba(139, 92, 246, 0.24);
@@ -175,7 +170,6 @@ st.markdown(
         backdrop-filter: blur(12px);
     }
 
-    /* Brand Header in Sidebar */
     .sidebar-brand {
         display: flex;
         align-items: center;
@@ -281,8 +275,27 @@ export default function(component) {
 
 
 # ---------------------------------------------------------------------------
-# Backend Image Processing & Model Helpers (Preserved + Extended)
+# Cached Resources & Data Helpers
 # ---------------------------------------------------------------------------
+@st.cache_resource(max_entries=2)
+def get_model() -> torch.nn.Module | None:
+    checkpoint_path = get_checkpoint_path()
+    if checkpoint_path is None:
+        return None
+    return load_model(str(checkpoint_path))
+
+
+@st.cache_resource(max_entries=1)
+def get_face_cascade():
+    cascade_cls = getattr(cv2, "CascadeClassifier", None)
+    data_ns = getattr(cv2, "data", None)
+    if cascade_cls is None or data_ns is None:
+        return None
+    cascade_path = data_ns.haarcascades + "haarcascade_frontalface_default.xml"
+    cascade = cascade_cls(cascade_path)
+    return None if cascade.empty() else cascade
+
+
 def b64_image(rgb: np.ndarray) -> str:
     ok, encoded = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
     if not ok:
@@ -302,6 +315,15 @@ def to_gray(rgb: np.ndarray) -> np.ndarray:
     if rgb.ndim == 2:
         return rgb
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+
+@st.cache_data(max_entries=16, show_spinner=False)
+def decode_upload_to_gray(file_bytes: bytes) -> np.ndarray:
+    arr = np.frombuffer(file_bytes, dtype=np.uint8)
+    gray = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        raise ValueError("Could not decode uploaded image.")
+    return gray
 
 
 def restore_image(
@@ -326,26 +348,59 @@ def restore_image(
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-@st.cache_resource(max_entries=2)
-def get_model() -> torch.nn.Module | None:
-    checkpoint_path = get_checkpoint_path()
-    if checkpoint_path is None:
-        return None
-    return load_model(str(checkpoint_path))
+@st.cache_data(max_entries=16, show_spinner=False)
+def restore_image_cached(
+    gray: np.ndarray,
+    clahe: bool,
+    denoise: bool,
+    upscale: bool,
+    brightness: int = 0,
+    contrast: float = 1.0,
+) -> np.ndarray:
+    return restore_image(gray, clahe, denoise, upscale, brightness, contrast)
+
+
+@st.cache_data(max_entries=8, show_spinner=False)
+def compute_slic_cached(gray: np.ndarray) -> np.ndarray:
+    gray_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+    return segmentation.slic(
+        cv2.cvtColor(gray_rgb, cv2.COLOR_RGB2LAB),
+        n_segments=48,
+        compactness=10,
+        sigma=1,
+        start_label=0,
+    )
+
+
+@st.cache_data(max_entries=8, show_spinner=False)
+def get_video_metadata(video_path: str) -> tuple[float, int, float]:
+    cap = cv2.VideoCapture(video_path)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    if not np.isfinite(fps) or fps <= 0:
+        fps = 30.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    duration = frame_count / fps if fps else 0.0
+    return fps, frame_count, duration
 
 
 def model_colorize(model: torch.nn.Module, gray: np.ndarray) -> np.ndarray:
-    lab_in = cv2.cvtColor(cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB)
     h, w = gray.shape
-    l_small = cv2.resize(lab_in[..., 0], (256, 256), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    gray_small = cv2.resize(gray, (256, 256), interpolation=cv2.INTER_AREA)
+    l_small = cv2.cvtColor(
+        cv2.cvtColor(gray_small, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
+    )[..., 0].astype(np.float32) / 255.0
     device = next(model.parameters()).device
     tensor = torch.from_numpy(l_small).unsqueeze(0).unsqueeze(0).to(device)
-    with torch.no_grad():
+    with torch.inference_mode():
         pred = model(tensor)
     ab = pred.squeeze(0).float().cpu().permute(1, 2, 0).numpy() * 128.0
     ab = cv2.resize(ab, (w, h), interpolation=cv2.INTER_CUBIC)
+    l_full = cv2.cvtColor(
+        cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
+    )[..., 0].astype(np.float32)
     lab = np.empty((h, w, 3), dtype=np.float32)
-    lab[..., 0] = lab_in[..., 0].astype(np.float32)
+    lab[..., 0] = l_full
     lab[..., 1:] = ab
     return np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 255).astype(np.uint8)
 
@@ -407,13 +462,15 @@ def apply_postprocessing(
         lab = apply_saturation_clamp(lab)
 
     if face_protection:
-        gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        faces = cv2.CascadeClassifier(cascade_path).detectMultiScale(gray_bgr, 1.1, 4)
-        for (x, y, fw, fh) in faces:
-            roi = lab[y:y + fh, x:x + fw]
-            roi[..., 1] = np.clip(roi[..., 1], 128 + 3, 128 + 22)
-            roi[..., 2] = np.clip(roi[..., 2], 128 + 8, 128 + 38)
+        cascade = get_face_cascade()
+        if cascade is not None:
+            small_gray = cv2.resize(gray, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            faces = cascade.detectMultiScale(small_gray, 1.1, 4)
+            for (x, y, fw, fh) in faces:
+                x, y, fw, fh = x * 2, y * 2, fw * 2, fh * 2
+                roi = lab[y:y + fh, x:x + fw]
+                roi[..., 1] = np.clip(roi[..., 1], 128 + 3, 128 + 22)
+                roi[..., 2] = np.clip(roi[..., 2], 128 + 8, 128 + 38)
 
     colorized = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 255).astype(np.uint8)
     if strength < 100:
@@ -423,10 +480,11 @@ def apply_postprocessing(
     return colorized
 
 
+@st.cache_data(max_entries=16, show_spinner=False)
 def dominant_colors(rgb: np.ndarray, count: int = 5) -> list[str]:
-    pixels = cv2.resize(rgb, (min(192, rgb.shape[1]), min(192, rgb.shape[0])), interpolation=cv2.INTER_AREA)
+    pixels = cv2.resize(rgb, (min(160, rgb.shape[1]), min(160, rgb.shape[0])), interpolation=cv2.INTER_AREA)
     lab = cv2.cvtColor(pixels, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.5)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
     _, labels, centers = cv2.kmeans(lab, count, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
     totals = np.bincount(labels.ravel(), minlength=count)
     centers_lab = np.uint8(centers[:, None, :])
@@ -552,12 +610,14 @@ DEFAULTS = {
     "recent_projects": [],
     "batch_results": [],
     "uploader_nonce": 0,
+    "is_processing": False,
 }
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
 
 
 model = get_model()
+face_cascade = get_face_cascade()
 
 
 # ---------------------------------------------------------------------------
@@ -704,12 +764,13 @@ if model is None:
 
 
 # ---------------------------------------------------------------------------
-# Webcam VideoProcessorClass (defined once, used in Live Webcam workspace)
+# Optimized Live Webcam VideoProcessor
 # ---------------------------------------------------------------------------
 class ColorizationProcessor(VideoProcessorBase):
-    def __init__(self, model_ref, resolution, wipe, face, clamp, preset="Balanced",
-                 brightness=0, contrast=1.0, strength=100):
+    def __init__(self, model_ref, cascade_ref, resolution, wipe, face, clamp,
+                 preset="Balanced", brightness=0, contrast=1.0, strength=100):
         self.model = model_ref
+        self.cascade = cascade_ref
         self.device = next(model_ref.parameters()).device
         self.resolution = resolution
         self.wipe = wipe
@@ -765,17 +826,23 @@ class ColorizationProcessor(VideoProcessorBase):
         if brightness != 0 or contrast != 1.0:
             gray = cv2.convertScaleAbs(gray, alpha=float(contrast), beta=float(brightness))
 
-        lab_in = cv2.cvtColor(cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB)
         h, w = gray.shape
-        l_small = cv2.resize(lab_in[..., 0], (resolution, resolution),
-                             interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        gray_small = cv2.resize(gray, (resolution, resolution), interpolation=cv2.INTER_AREA)
+        l_small = cv2.cvtColor(
+            cv2.cvtColor(gray_small, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
+        )[..., 0].astype(np.float32) / 255.0
+
         tensor = torch.from_numpy(l_small).unsqueeze(0).unsqueeze(0).to(self.device)
-        with torch.no_grad():
+        with torch.inference_mode():
             pred = self.model(tensor)
         ab = pred.squeeze(0).float().cpu().permute(1, 2, 0).numpy() * 128.0
         ab = cv2.resize(ab, (w, h), interpolation=cv2.INTER_CUBIC)
+
+        l_full = cv2.cvtColor(
+            cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
+        )[..., 0].astype(np.float32)
         lab = np.empty((h, w, 3), dtype=np.float32)
-        lab[..., 0] = lab_in[..., 0]
+        lab[..., 0] = l_full
         lab[..., 1:] = ab
 
         if preset == "Vintage":
@@ -789,12 +856,11 @@ class ColorizationProcessor(VideoProcessorBase):
 
         if clamp:
             lab = apply_saturation_clamp(lab)
-        if face:
-            gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            faces = cv2.CascadeClassifier(
-                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            ).detectMultiScale(gray_bgr, 1.1, 4)
+        if face and self.cascade is not None:
+            small_gray = cv2.resize(gray, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            faces = self.cascade.detectMultiScale(small_gray, 1.1, 4)
             for (x, y, fw, fh) in faces:
+                x, y, fw, fh = x * 2, y * 2, fw * 2, fh * 2
                 roi = lab[y:y + fh, x:x + fw]
                 roi[..., 1] = np.clip(roi[..., 1], 131, 150)
                 roi[..., 2] = np.clip(roi[..., 2], 136, 166)
@@ -813,8 +879,8 @@ class ColorizationProcessor(VideoProcessorBase):
         output[:, :split] = gray_bgr[:, :split]
         cv2.line(output, (split, 0), (split, h), (255, 255, 255), 2)
         with self.lock:
-            self.latest_gray = gray_bgr.copy()
-            self.latest_color = colorized.copy()
+            self.latest_gray = gray_bgr
+            self.latest_color = colorized
             if self.record_writer is not None:
                 self.record_writer.write(output)
         now = time.perf_counter()
@@ -845,13 +911,11 @@ if active_page == "Dashboard":
         unsafe_allow_html=True,
     )
 
-    # Statistics Row
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Images Colorized", st.session_state.stats_images, border=True)
     m2.metric("Videos Rendered", st.session_state.stats_videos, border=True)
     m3.metric("Batch Jobs", st.session_state.stats_batches, border=True)
-    model_state = "Active" if model is not None else "Offline"
-    m4.metric("AI Model", model_state, border=True)
+    m4.metric("AI Model", "Active" if model is not None else "Offline", border=True)
 
     st.subheader("Workspaces & Quick Actions", anchor=False)
     c1, c2 = st.columns(2)
@@ -997,16 +1061,19 @@ elif active_page == "Image Studio":
             unsafe_allow_html=True,
         )
     else:
-        rgb = rgb_from_upload(uploaded)
-        gray = to_gray(rgb)
-        gray = restore_image(
-            gray,
-            st.session_state.get("restore_clahe", False),
-            st.session_state.get("restore_denoise", False),
-            st.session_state.get("restore_upscale", False),
-            st.session_state.get("brightness_adj", 0),
-            st.session_state.get("contrast_adj", 1.0),
-        )
+        try:
+            raw_gray = decode_upload_to_gray(uploaded.getvalue())
+            gray = restore_image_cached(
+                raw_gray,
+                st.session_state.get("restore_clahe", False),
+                st.session_state.get("restore_denoise", False),
+                st.session_state.get("restore_upscale", False),
+                st.session_state.get("brightness_adj", 0),
+                st.session_state.get("contrast_adj", 1.0),
+            )
+        except Exception as exc:
+            st.error(f"Could not process uploaded image: {exc}")
+            st.stop()
 
         prev_col, action_col = st.columns([2, 1], vertical_alignment="top")
         with prev_col:
@@ -1026,12 +1093,14 @@ elif active_page == "Image Studio":
             )
             if st.button("Colorize Image", icon=":material/auto_awesome:", type="primary",
                          width="stretch", key="colorize_image",
+                         disabled=st.session_state.is_processing,
                          help="Run the AI model and extract a smart color palette."):
                 if model is None:
                     st.error("Load a model checkpoint before colorizing.")
                 else:
-                    prog = st.progress(15, text="Preparing luminance tensor...")
-                    with st.spinner("Running AI colorization..."):
+                    st.session_state.is_processing = True
+                    try:
+                        prog = st.progress(15, text="Preparing luminance tensor...")
                         raw_output = model_colorize(model, gray)
                         prog.progress(65, text="Applying restoration, hints & preset...")
                         output = apply_postprocessing(
@@ -1046,24 +1115,32 @@ elif active_page == "Image Studio":
                         )
                         st.session_state.output_rgb = output
                         st.session_state.input_gray = gray
+                        st.session_state.compare_b64_after = b64_image(output)
+                        st.session_state.compare_b64_before = b64_image(cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB))
                         st.session_state.palette = dominant_colors(output)
                         st.session_state.stats_images += 1
                         record_project(uploaded.name, "Image Studio", st.session_state.preset)
                         push_history()
                         prog.progress(100, text="Colorization complete!")
-                    st.success("Image colorized successfully!", icon=":material/check_circle:")
+                        st.success("Image colorized successfully!", icon=":material/check_circle:")
+                    except Exception as exc:
+                        st.error(f"Colorization failed: {exc}")
+                    finally:
+                        st.session_state.is_processing = False
 
             if st.button("Reset edits", icon=":material/restart_alt:", width="stretch",
                          key="reset_image_edits_btn", help="Clear hints, regions, and output preview."):
                 st.session_state.hints = []
                 st.session_state.regions = []
                 st.session_state.pop("output_rgb", None)
+                st.session_state.pop("compare_b64_after", None)
+                st.session_state.pop("compare_b64_before", None)
                 st.rerun()
 
             if st.button("Upload another image", icon=":material/upload_file:", width="stretch",
                          key="clear_image_btn", help="Clear the current image and upload a new one."):
-                st.session_state.pop("output_rgb", None)
-                st.session_state.pop("input_gray", None)
+                for k in ("output_rgb", "input_gray", "compare_b64_after", "compare_b64_before", "superpixels"):
+                    st.session_state.pop(k, None)
                 st.session_state.hints = []
                 st.session_state.regions = []
                 st.session_state.uploader_nonce += 1
@@ -1076,9 +1153,11 @@ elif active_page == "Image Studio":
 
             st.subheader("Before & After Comparison", anchor=False)
             value = st.session_state.get("compare_slider", 50)
+            b64_after = st.session_state.get("compare_b64_after") or b64_image(output)
+            b64_before = st.session_state.get("compare_b64_before") or b64_image(gray_rgb)
             result = COMPARE_COMPONENT(
                 key="compare_component",
-                data={"base": b64_image(output), "before": b64_image(gray_rgb), "value": value},
+                data={"base": b64_after, "before": b64_before, "value": value},
                 default={"value": value},
                 on_value_change=lambda: None,
             )
@@ -1126,11 +1205,7 @@ elif active_page == "Image Studio":
             if c1.button("Suggest hints", icon=":material/auto_fix_high:", width="stretch",
                          help="Detect SLIC superpixels and start segment assignment.",
                          key="suggest_hints"):
-                labels = segmentation.slic(
-                    cv2.cvtColor(gray_rgb, cv2.COLOR_RGB2LAB),
-                    n_segments=48, compactness=10, sigma=1, start_label=0,
-                )
-                st.session_state.superpixels = labels
+                st.session_state.superpixels = compute_slic_cached(gray_show)
                 st.session_state.overlay_segments = True
             if c2.button("Randomize palette", icon=":material/casino:", width="stretch",
                          help="Preview harmonious five-color palettes.",
@@ -1265,10 +1340,7 @@ elif active_page == "Image Studio":
                                           [cv2.IMWRITE_JPEG_QUALITY, quality])
                     data, mime, name = buf.tobytes(), "image/jpeg", "colorized.jpg"
                 else:
-                    frames = []
-                    for _ in st.session_state.hints + st.session_state.regions:
-                        frames.append(Image.fromarray(output))
-                    pil_frames = frames or [Image.fromarray(output)]
+                    pil_frames = [Image.fromarray(output)]
                     bio = io.BytesIO()
                     pil_frames[0].save(bio, format="GIF", save_all=True,
                                        append_images=pil_frames[1:], duration=700, loop=0)
@@ -1331,15 +1403,21 @@ elif active_page == "Video Studio":
             unsafe_allow_html=True,
         )
     else:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_video.name).suffix) as tmp:
-            tmp.write(uploaded_video.getbuffer())
-            video_path = tmp.name
+        video_key = f"{uploaded_video.name}_{uploaded_video.size}"
+        if st.session_state.get("video_file_id") != video_key or not Path(st.session_state.get("video_temp_path", "")).exists():
+            old_path = st.session_state.get("video_temp_path")
+            if old_path and Path(old_path).exists():
+                try:
+                    Path(old_path).unlink()
+                except OSError:
+                    pass
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_video.name).suffix) as tmp:
+                tmp.write(uploaded_video.getbuffer())
+                st.session_state.video_temp_path = tmp.name
+                st.session_state.video_file_id = video_key
 
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps if fps else 0.0
-        cap.release()
+        video_path = st.session_state.video_temp_path
+        fps, frame_count, duration = get_video_metadata(video_path)
 
         v_left, v_right = st.columns([2, 1], vertical_alignment="top")
         with v_left:
@@ -1374,7 +1452,7 @@ elif active_page == "Video Studio":
                 cap.release()
                 if ok and frame_bgr is not None:
                     gray = to_gray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-                    gray = restore_image(
+                    gray = restore_image_cached(
                         gray,
                         st.session_state.restore_clahe,
                         st.session_state.restore_denoise,
@@ -1393,6 +1471,8 @@ elif active_page == "Video Studio":
                              width="stretch", alt="Original video frame")
                     f2.image(col_rgb, caption=f"Frame {frame_index} (Colorized)",
                              width="stretch", alt="Colorized video frame")
+                else:
+                    st.warning("Could not read the selected frame from video.")
 
         st.subheader("Timeline Keyframes", anchor=False)
         kf_col1, kf_col2, kf_col3 = st.columns([2, 2, 1], vertical_alignment="bottom")
@@ -1415,17 +1495,24 @@ elif active_page == "Video Studio":
             st.toast(f"Added {keyframe_preset} keyframe at {keyframe_time:.2f}s")
 
         if st.button("Render Colorized Video", icon=":material/movie:", type="primary",
-                     width="stretch", help="Colorize every frame and encode an MP4.", key="render_video"):
+                     width="stretch", help="Colorize every frame and encode an MP4.",
+                     key="render_video", disabled=st.session_state.is_processing):
             if model is None:
                 st.error("Load a model checkpoint before rendering.")
             else:
-                with tempfile.TemporaryDirectory() as td:
-                    silent_output = str(Path(td) / "silent.mp4")
-                    final_output = str(Path(td) / "colorized.mp4")
-                    progress = st.progress(10, text="Colorizing video frames...")
-                    with st.spinner("Rendering video..."):
-                        colorize_video(model, video_path, silent_output)
-                        progress.progress(80, text="Finalizing MP4 container...")
+                st.session_state.is_processing = True
+                try:
+                    with tempfile.TemporaryDirectory() as td:
+                        silent_output = str(Path(td) / "silent.mp4")
+                        final_output = str(Path(td) / "colorized.mp4")
+                        progress = st.progress(0, text="Starting video colorization...")
+
+                        def on_frame(done, total):
+                            pct = min(90, int((done / max(total, 1)) * 90))
+                            progress.progress(pct, text=f"Colorizing frame {done}/{total}...")
+
+                        colorize_video(model, video_path, silent_output, progress_callback=on_frame)
+                        progress.progress(94, text="Finalizing MP4 container...")
                         if keep_audio and shutil.which("ffmpeg"):
                             subprocess.run([
                                 "ffmpeg", "-y", "-i", silent_output, "-i", video_path,
@@ -1433,21 +1520,28 @@ elif active_page == "Video Studio":
                             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                         else:
                             shutil.copyfile(silent_output, final_output)
-                    progress.progress(100, text="Video rendering complete!")
-                    st.session_state.stats_videos += 1
-                    record_project(uploaded_video.name, "Video Studio", st.session_state.preset)
-                    st.success("Video rendered successfully!", icon=":material/check_circle:")
-                    st.video(final_output, width="stretch", alt="Rendered colorized video")
-                    with open(final_output, "rb") as f:
-                        st.download_button(
-                            "Download Colorized Video",
-                            f.read(),
-                            f"{Path(uploaded_video.name).stem}-colorized.mp4",
-                            "video/mp4",
-                            icon=":material/download:",
-                            width="stretch",
-                            key="download_video",
-                        )
+                        progress.progress(100, text="Video rendering complete!")
+                        st.session_state.rendered_video_bytes = Path(final_output).read_bytes()
+                        st.session_state.rendered_video_name = f"{Path(uploaded_video.name).stem}-colorized.mp4"
+                        st.session_state.stats_videos += 1
+                        record_project(uploaded_video.name, "Video Studio", st.session_state.preset)
+                        st.success("Video rendered successfully!", icon=":material/check_circle:")
+                except Exception as exc:
+                    st.error(f"Video rendering failed: {exc}")
+                finally:
+                    st.session_state.is_processing = False
+
+        if st.session_state.get("rendered_video_bytes"):
+            st.video(st.session_state.rendered_video_bytes, width="stretch", alt="Rendered colorized video")
+            st.download_button(
+                "Download Colorized Video",
+                st.session_state.rendered_video_bytes,
+                st.session_state.get("rendered_video_name", "colorized.mp4"),
+                "video/mp4",
+                icon=":material/download:",
+                width="stretch",
+                key="download_video",
+            )
 
 
 # ===========================================================================
@@ -1463,10 +1557,10 @@ elif active_page == "Live Webcam":
             "Processing resolution",
             128,
             256,
-            256,
+            192,
             64,
             key="webcam_resolution",
-            help="Lower resolution improves CPU speed.",
+            help="Lower resolution improves real-time CPU frame rate.",
         )
         wipe = ctrl2.slider(
             "Split-screen comparison (%)",
@@ -1483,6 +1577,7 @@ elif active_page == "Live Webcam":
                 key="colorization-webcam",
                 video_processor_factory=lambda: ColorizationProcessor(
                     model,
+                    face_cascade,
                     resolution,
                     wipe,
                     st.session_state.face_protection,
@@ -1613,49 +1708,58 @@ elif active_page == "Batch Studio":
 
         if st.button("Process All Images", icon=":material/burst_mode:", type="primary",
                      width="stretch", key="process_batch",
+                     disabled=st.session_state.is_processing,
                      help="Colorize all uploaded images and package as a ZIP."):
             if model is None:
                 st.error("Load a model checkpoint before batch processing.")
             else:
+                st.session_state.is_processing = True
                 results = []
                 prog = st.progress(0, text="Starting batch colorization...")
-                with tempfile.TemporaryDirectory() as td:
-                    zip_path = Path(td) / "colorized-batch.zip"
-                    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                        for idx, upload in enumerate(uploads):
-                            rgb = rgb_from_upload(upload)
-                            gray = restore_image(
-                                to_gray(rgb),
-                                st.session_state.restore_clahe,
-                                st.session_state.restore_denoise,
-                                st.session_state.restore_upscale,
-                                st.session_state.brightness_adj,
-                                st.session_state.contrast_adj,
-                            )
-                            raw_out = model_colorize(model, gray)
-                            out = apply_postprocessing(
-                                raw_out,
-                                gray,
-                                st.session_state.preset,
-                                st.session_state.saturation_clamp,
-                                st.session_state.face_protection,
-                                st.session_state.processing_strength,
-                            )
-                            ok, enc = cv2.imencode(".png", cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
-                            if ok:
-                                png_bytes = enc.tobytes()
-                                out_name = Path(upload.name).stem + "-colorized.png"
-                                zf.writestr(out_name, png_bytes)
-                                results.append({"name": out_name, "bytes": png_bytes, "rgb": out})
-                            prog.progress(int(((idx + 1) / len(uploads)) * 100),
-                                          text=f"Processed {idx + 1}/{len(uploads)}: {upload.name}")
-                    st.session_state.batch_results = results
-                    st.session_state.batch_zip_bytes = zip_path.read_bytes()
-                    st.session_state.stats_batches += 1
-                    st.session_state.stats_images += len(results)
-                    record_project(f"Batch ({len(results)} images)", "Batch Studio", st.session_state.preset)
-                st.success(f"Completed batch processing for {len(results)} image(s)!",
-                           icon=":material/check_circle:")
+                try:
+                    with tempfile.TemporaryDirectory() as td:
+                        zip_path = Path(td) / "colorized-batch.zip"
+                        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                            for idx, upload in enumerate(uploads):
+                                raw_gray = decode_upload_to_gray(upload.getvalue())
+                                gray = restore_image(
+                                    raw_gray,
+                                    st.session_state.restore_clahe,
+                                    st.session_state.restore_denoise,
+                                    st.session_state.restore_upscale,
+                                    st.session_state.brightness_adj,
+                                    st.session_state.contrast_adj,
+                                )
+                                raw_out = model_colorize(model, gray)
+                                out = apply_postprocessing(
+                                    raw_out,
+                                    gray,
+                                    st.session_state.preset,
+                                    st.session_state.saturation_clamp,
+                                    st.session_state.face_protection,
+                                    st.session_state.processing_strength,
+                                )
+                                ok, enc = cv2.imencode(".png", cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
+                                if ok:
+                                    png_bytes = enc.tobytes()
+                                    out_name = Path(upload.name).stem + "-colorized.png"
+                                    zf.writestr(out_name, png_bytes)
+                                    results.append({"name": out_name, "bytes": png_bytes})
+                                prog.progress(
+                                    int(((idx + 1) / len(uploads)) * 100),
+                                    text=f"Processed {idx + 1}/{len(uploads)}: {upload.name}",
+                                )
+                        st.session_state.batch_results = results
+                        st.session_state.batch_zip_bytes = zip_path.read_bytes()
+                        st.session_state.stats_batches += 1
+                        st.session_state.stats_images += len(results)
+                        record_project(f"Batch ({len(results)} images)", "Batch Studio", st.session_state.preset)
+                    st.success(f"Completed batch processing for {len(results)} image(s)!",
+                               icon=":material/check_circle:")
+                except Exception as exc:
+                    st.error(f"Batch processing failed: {exc}")
+                finally:
+                    st.session_state.is_processing = False
 
         if st.session_state.get("batch_results"):
             st.subheader("Processed Results", anchor=False)
@@ -1664,7 +1768,7 @@ elif active_page == "Batch Studio":
             for idx, item in enumerate(res_list):
                 with rcols[idx % len(rcols)]:
                     st.badge("Done", icon=":material/check:", color="green")
-                    st.image(item["rgb"], caption=item["name"], width="stretch", alt=item["name"])
+                    st.image(item["bytes"], caption=item["name"], width="stretch", alt=item["name"])
                     st.download_button(
                         "Download",
                         data=item["bytes"],

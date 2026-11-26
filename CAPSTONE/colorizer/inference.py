@@ -36,7 +36,7 @@ def colorize_image(model: UNet, image_path: str, output_path: str) -> None:
     # Convert to LAB tensor (L + ab)
     lab = rgb_to_lab_tensor(img_resized / 255.0)
     L = lab[0].unsqueeze(0).unsqueeze(0).to(DEVICE)  # (1,1,256,256)
-    with torch.no_grad():
+    with torch.inference_mode():
         pred_ab = model(L)
     # Combine L and predicted ab
     pred_lab = torch.cat([L.squeeze(0), pred_ab.squeeze(0)], dim=0)
@@ -46,7 +46,7 @@ def colorize_image(model: UNet, image_path: str, output_path: str) -> None:
     cv2.imwrite(output_path, cv2.cvtColor(colorized, cv2.COLOR_RGB2BGR))
     print(f"Saved colorized image to {output_path}")
 
-def colorize_video(model: UNet, video_path: str, output_path: str) -> None:
+def colorize_video(model: UNet, video_path: str, output_path: str, progress_callback=None) -> None:
     cap = cv2.VideoCapture(video_path)
     fps = float(cap.get(cv2.CAP_PROP_FPS))
     if not np.isfinite(fps) or fps <= 0:
@@ -56,42 +56,56 @@ def colorize_video(model: UNet, video_path: str, output_path: str) -> None:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     output_width = width + width % 2
     output_height = height + height % 2
-    pbar = tqdm(total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), desc='Processing video')
+    total_frames = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0)
+    device = next(model.parameters()).device
+    pbar = tqdm(total=total_frames, desc='Processing video')
+    processed = 0
     try:
         with av.open(output_path, mode='w') as output:
             output_stream = output.add_stream('libx264', rate=frame_rate)
             output_stream.width = output_width
             output_stream.height = output_height
             output_stream.pix_fmt = 'yuv420p'
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                rgb_resized = cv2.resize(rgb, (256, 256))
-                lab = rgb_to_lab_tensor(rgb_resized / 255.0)
-                L = lab[0].unsqueeze(0).unsqueeze(0).to(DEVICE)
-                with torch.no_grad():
+            with torch.inference_mode():
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    gray_small = cv2.resize(gray, (256, 256), interpolation=cv2.INTER_AREA)
+                    l_small = cv2.cvtColor(
+                        cv2.cvtColor(gray_small, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
+                    )[..., 0].astype(np.float32) / 255.0
+                    L = torch.from_numpy(l_small).unsqueeze(0).unsqueeze(0).to(device)
                     pred_ab = model(L)
-                pred_lab = torch.cat([L.squeeze(0), pred_ab.squeeze(0)], dim=0)
-                colorized = lab_tensor_to_rgb(pred_lab)
-                colorized = cv2.resize(colorized, (width, height))
-                if output_width != width or output_height != height:
-                    colorized = cv2.copyMakeBorder(
-                        colorized,
-                        0,
-                        output_height - height,
-                        0,
-                        output_width - width,
-                        cv2.BORDER_REPLICATE,
+                    ab = pred_ab.squeeze(0).float().cpu().permute(1, 2, 0).numpy() * 128.0
+                    ab = cv2.resize(ab, (width, height), interpolation=cv2.INTER_CUBIC)
+                    l_full = cv2.cvtColor(
+                        cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
+                    )[..., 0].astype(np.float32)
+                    lab = np.empty((height, width, 3), dtype=np.float32)
+                    lab[..., 0] = l_full
+                    lab[..., 1:] = ab
+                    bgr_out = cv2.cvtColor(
+                        np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 255).astype(np.uint8),
+                        cv2.COLOR_RGB2BGR,
                     )
-                output_frame = av.VideoFrame.from_ndarray(
-                    cv2.cvtColor(colorized, cv2.COLOR_RGB2BGR),
-                    format='bgr24',
-                )
-                for packet in output_stream.encode(output_frame):
-                    output.mux(packet)
-                pbar.update(1)
+                    if output_width != width or output_height != height:
+                        bgr_out = cv2.copyMakeBorder(
+                            bgr_out,
+                            0,
+                            output_height - height,
+                            0,
+                            output_width - width,
+                            cv2.BORDER_REPLICATE,
+                        )
+                    output_frame = av.VideoFrame.from_ndarray(bgr_out, format='bgr24')
+                    for packet in output_stream.encode(output_frame):
+                        output.mux(packet)
+                    processed += 1
+                    pbar.update(1)
+                    if progress_callback is not None and total_frames > 0:
+                        progress_callback(processed, total_frames)
             for packet in output_stream.encode():
                 output.mux(packet)
     finally:
