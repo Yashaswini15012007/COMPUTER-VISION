@@ -384,24 +384,117 @@ def get_video_metadata(video_path: str) -> tuple[float, int, float]:
     return fps, frame_count, duration
 
 
+def validate_image_array(img: np.ndarray, name: str = "Image") -> np.ndarray:
+    """Validate that the image is a non-empty, finite numpy array."""
+    if img is None:
+        raise ValueError(f"{name} is None.")
+    if not isinstance(img, np.ndarray):
+        raise TypeError(f"{name} must be a numpy ndarray, got {type(img)}.")
+    if img.size == 0:
+        raise ValueError(f"{name} is empty.")
+    if not np.isfinite(img).all():
+        raise ValueError(f"{name} contains NaN or Inf values.")
+    return img
+
+
+def to_normalized_gray_f32(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Robustly ensure input is 2D grayscale uint8 [0, 255] and float32 [0.0, 1.0].
+    Handles:
+    - 2D or 3D (RGB/BGR/single-channel) inputs
+    - uint8 [0, 255]
+    - float32/float64 [0.0, 1.0] or [0.0, 255.0]
+    Returns (gray_uint8, gray_f32_01).
+    """
+    validate_image_array(gray, "Input grayscale")
+
+    # Handle 3D channel reduction if user passes RGB/BGR
+    if gray.ndim == 3:
+        if gray.shape[2] == 1:
+            gray = gray[:, :, 0]
+        elif gray.shape[2] in (3, 4):
+            gray = cv2.cvtColor(gray[:, :, :3], cv2.COLOR_RGB2GRAY)
+        else:
+            raise ValueError(f"Unsupported number of image channels: {gray.shape[2]}")
+
+    if gray.ndim != 2:
+        raise ValueError(f"Expected 2D grayscale image, got shape {gray.shape}")
+
+    # Standardize to uint8 and float32 [0.0, 1.0]
+    if np.issubdtype(gray.dtype, np.floating):
+        if gray.max() <= 1.05 and gray.min() >= -0.05:
+            gray_f32 = np.clip(gray, 0.0, 1.0).astype(np.float32)
+            gray_uint8 = np.clip(gray_f32 * 255.0, 0, 255).astype(np.uint8)
+        else:
+            gray_uint8 = np.clip(gray, 0, 255).astype(np.uint8)
+            gray_f32 = gray_uint8.astype(np.float32) / 255.0
+    elif gray.dtype == np.uint8:
+        gray_uint8 = gray
+        gray_f32 = gray.astype(np.float32) / 255.0
+    else:
+        gray_uint8 = np.clip(gray, 0, 255).astype(np.uint8)
+        gray_f32 = gray_uint8.astype(np.float32) / 255.0
+
+    return gray_uint8, gray_f32
+
+
 def model_colorize(model: torch.nn.Module, gray: np.ndarray) -> np.ndarray:
-    h, w = gray.shape
-    gray_small = cv2.resize(gray, (256, 256), interpolation=cv2.INTER_AREA)
-    rgb_small_f32 = cv2.cvtColor(gray_small, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
+    """
+    Colorize a grayscale image using the trained UNet model.
+    Guarantees:
+    - Exact matching dimensions (H, W, 3) as input
+    - Valid RGB uint8 output in [0, 255]
+    - Robust to any input dtype/range (uint8, float32, 2D, 3D)
+    - Rejects all-zero or corrupted results
+    """
+    gray_uint8, gray_f32 = to_normalized_gray_f32(gray)
+    h, w = gray_uint8.shape
+
+    # 1. Prepare 256x256 model input
+    gray_small_f32 = cv2.resize(gray_f32, (256, 256), interpolation=cv2.INTER_AREA)
+    rgb_small_f32 = cv2.cvtColor(gray_small_f32, cv2.COLOR_GRAY2RGB)
     l_small = cv2.cvtColor(rgb_small_f32, cv2.COLOR_RGB2LAB)[..., 0] / 100.0
+
     device = next(model.parameters()).device
     tensor = torch.from_numpy(l_small).unsqueeze(0).unsqueeze(0).to(device)
+
+    # 2. Run inference
     with torch.inference_mode():
         pred = model(tensor)
+
+    # 3. Validate raw tensor output
+    if pred is None:
+        raise RuntimeError("Model returned None during inference.")
+    if torch.isnan(pred).any() or torch.isinf(pred).any():
+        raise RuntimeError("Model generated NaN or Inf values.")
+
+    # 4. Denormalize predicted ab channels
     ab = pred.squeeze(0).float().cpu().permute(1, 2, 0).numpy() * 128.0
     ab = cv2.resize(ab, (w, h), interpolation=cv2.INTER_CUBIC)
-    rgb_full_f32 = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
+
+    # 5. Full-resolution L channel from original input (preserves exact sharp details)
+    rgb_full_f32 = cv2.cvtColor(gray_f32, cv2.COLOR_GRAY2RGB)
     l_full = cv2.cvtColor(rgb_full_f32, cv2.COLOR_RGB2LAB)[..., 0]
+
+    # 6. Recombine full L + predicted ab
     lab = np.empty((h, w, 3), dtype=np.float32)
     lab[..., 0] = l_full
     lab[..., 1:] = ab
+
+    # 7. Convert LAB to RGB
     rgb_out = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-    return (np.clip(rgb_out, 0.0, 1.0) * 255.0).astype(np.uint8)
+    output_rgb = (np.clip(rgb_out, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    # 8. Post-inference verification
+    validate_image_array(output_rgb, "Model output RGB")
+    if output_rgb.shape != (h, w, 3):
+        raise ValueError(f"Output shape {output_rgb.shape} does not match expected ({h}, {w}, 3)")
+
+    # Safeguard against unexpected completely black output when input is non-black
+    if gray_uint8.max() > 10 and output_rgb.max() == 0:
+        raise RuntimeError("Model output is completely black for a non-black input image.")
+
+    return output_rgb
 
 
 def lab_color(rgb_hex: str) -> tuple[float, float]:
@@ -1171,8 +1264,16 @@ elif active_page == "Image Studio":
             )
 
             side_a, side_b = st.columns(2)
-            side_a.image(gray_rgb, caption="Original / Restored Grayscale", width="stretch", alt="Original grayscale")
-            side_b.image(output, caption="AI Colorized Result", width="stretch", alt="Colorized output")
+            side_a.image(gray_rgb, caption=f"Original / Restored ({gray_show.shape[1]}x{gray_show.shape[0]})", width="stretch", alt="Original grayscale")
+            side_b.image(output, caption=f"AI Colorized Result ({output.shape[1]}x{output.shape[0]})", width="stretch", alt="Colorized output")
+
+            with st.expander("AI Pipeline Diagnostics & Metrics", expanded=False):
+                d_c1, d_c2, d_c3, d_c4 = st.columns(4)
+                d_c1.metric("Input Dimensions", f"{gray_show.shape[1]} x {gray_show.shape[0]}")
+                d_c2.metric("Output Dimensions", f"{output.shape[1]} x {output.shape[0]}")
+                d_c3.metric("Input Min / Max", f"{int(gray_show.min())} / {int(gray_show.max())}")
+                d_c4.metric("Output Min / Max / Mean", f"{int(output.min())} / {int(output.max())} / {float(output.mean()):.1f}")
+                st.caption(f"Channels: Input {gray_show.ndim}D Grayscale | Output {output.ndim}D RGB ({output.shape[2]} channels) | Model Resolution: 256x256 -> native interpolated")
 
             ok_png, png_buf = cv2.imencode(".png", cv2.cvtColor(output, cv2.COLOR_RGB2BGR))
             if ok_png:
