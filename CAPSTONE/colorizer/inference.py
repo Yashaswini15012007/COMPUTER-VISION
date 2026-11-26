@@ -73,23 +73,19 @@ def colorize_video(model: UNet, video_path: str, output_path: str, progress_call
                         break
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     gray_small = cv2.resize(gray, (256, 256), interpolation=cv2.INTER_AREA)
-                    l_small = cv2.cvtColor(
-                        cv2.cvtColor(gray_small, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
-                    )[..., 0].astype(np.float32) / 255.0
+                    rgb_small_f32 = cv2.cvtColor(gray_small, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
+                    l_small = cv2.cvtColor(rgb_small_f32, cv2.COLOR_RGB2LAB)[..., 0] / 100.0
                     L = torch.from_numpy(l_small).unsqueeze(0).unsqueeze(0).to(device)
                     pred_ab = model(L)
                     ab = pred_ab.squeeze(0).float().cpu().permute(1, 2, 0).numpy() * 128.0
                     ab = cv2.resize(ab, (width, height), interpolation=cv2.INTER_CUBIC)
-                    l_full = cv2.cvtColor(
-                        cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
-                    )[..., 0].astype(np.float32)
+                    rgb_full_f32 = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
+                    l_full = cv2.cvtColor(rgb_full_f32, cv2.COLOR_RGB2LAB)[..., 0]
                     lab = np.empty((height, width, 3), dtype=np.float32)
                     lab[..., 0] = l_full
                     lab[..., 1:] = ab
-                    bgr_out = cv2.cvtColor(
-                        np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 255).astype(np.uint8),
-                        cv2.COLOR_RGB2BGR,
-                    )
+                    rgb_out = (np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0.0, 1.0) * 255.0).astype(np.uint8)
+                    bgr_out = cv2.cvtColor(rgb_out, cv2.COLOR_RGB2BGR)
                     if output_width != width or output_height != height:
                         bgr_out = cv2.copyMakeBorder(
                             bgr_out,

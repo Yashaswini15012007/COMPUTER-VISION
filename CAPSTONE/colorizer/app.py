@@ -387,30 +387,29 @@ def get_video_metadata(video_path: str) -> tuple[float, int, float]:
 def model_colorize(model: torch.nn.Module, gray: np.ndarray) -> np.ndarray:
     h, w = gray.shape
     gray_small = cv2.resize(gray, (256, 256), interpolation=cv2.INTER_AREA)
-    l_small = cv2.cvtColor(
-        cv2.cvtColor(gray_small, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
-    )[..., 0].astype(np.float32) / 255.0
+    rgb_small_f32 = cv2.cvtColor(gray_small, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
+    l_small = cv2.cvtColor(rgb_small_f32, cv2.COLOR_RGB2LAB)[..., 0] / 100.0
     device = next(model.parameters()).device
     tensor = torch.from_numpy(l_small).unsqueeze(0).unsqueeze(0).to(device)
     with torch.inference_mode():
         pred = model(tensor)
     ab = pred.squeeze(0).float().cpu().permute(1, 2, 0).numpy() * 128.0
     ab = cv2.resize(ab, (w, h), interpolation=cv2.INTER_CUBIC)
-    l_full = cv2.cvtColor(
-        cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
-    )[..., 0].astype(np.float32)
+    rgb_full_f32 = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
+    l_full = cv2.cvtColor(rgb_full_f32, cv2.COLOR_RGB2LAB)[..., 0]
     lab = np.empty((h, w, 3), dtype=np.float32)
     lab[..., 0] = l_full
     lab[..., 1:] = ab
-    return np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 255).astype(np.uint8)
+    rgb_out = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    return (np.clip(rgb_out, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
 def lab_color(rgb_hex: str) -> tuple[float, float]:
     rgb = np.array([[
         [int(rgb_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
-    ]], dtype=np.uint8)
+    ]], dtype=np.uint8).astype(np.float32) / 255.0
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)[0, 0]
-    return float(lab[1] - 128.0), float(lab[2] - 128.0)
+    return float(lab[1]), float(lab[2])
 
 
 def apply_saturation_clamp(lab: np.ndarray) -> np.ndarray:
@@ -431,23 +430,23 @@ def apply_postprocessing(
     hints: list | None = None,
     regions: list | None = None,
 ) -> np.ndarray:
-    lab = cv2.cvtColor(output_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab = cv2.cvtColor(output_rgb.astype(np.float32) / 255.0, cv2.COLOR_RGB2LAB)
 
     for layer in hints or []:
         if not layer.get("visible", True):
             continue
         mask = png_to_mask(layer["mask"], gray.shape)
         a, b = lab_color(layer["color"])
-        lab[..., 1][mask] = a + 128
-        lab[..., 2][mask] = b + 128
+        lab[..., 1][mask] = a
+        lab[..., 2][mask] = b
 
     for layer in regions or []:
         if not layer.get("visible", True):
             continue
         mask = png_to_mask(layer["mask"], gray.shape)
         a, b = lab_color(layer["color"])
-        lab[..., 1][mask] = a + 128
-        lab[..., 2][mask] = b + 128
+        lab[..., 1][mask] = a
+        lab[..., 2][mask] = b
 
     if preset == "Vintage":
         lab[..., 1] *= 0.78
@@ -456,7 +455,7 @@ def apply_postprocessing(
         lab[..., 1] *= 1.18
         lab[..., 2] *= 1.18
     elif preset == "Cinema":
-        lab[..., 1] -= 3
+        lab[..., 1] -= 3.0
 
     if saturation_clamp:
         lab = apply_saturation_clamp(lab)
@@ -469,10 +468,10 @@ def apply_postprocessing(
             for (x, y, fw, fh) in faces:
                 x, y, fw, fh = x * 2, y * 2, fw * 2, fh * 2
                 roi = lab[y:y + fh, x:x + fw]
-                roi[..., 1] = np.clip(roi[..., 1], 128 + 3, 128 + 22)
-                roi[..., 2] = np.clip(roi[..., 2], 128 + 8, 128 + 38)
+                roi[..., 1] = np.clip(roi[..., 1], 3.0, 22.0)
+                roi[..., 2] = np.clip(roi[..., 2], 8.0, 38.0)
 
-    colorized = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 255).astype(np.uint8)
+    colorized = (np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0.0, 1.0) * 255.0).astype(np.uint8)
     if strength < 100:
         alpha = max(0.0, min(1.0, strength / 100.0))
         gray_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
@@ -828,9 +827,8 @@ class ColorizationProcessor(VideoProcessorBase):
 
         h, w = gray.shape
         gray_small = cv2.resize(gray, (resolution, resolution), interpolation=cv2.INTER_AREA)
-        l_small = cv2.cvtColor(
-            cv2.cvtColor(gray_small, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
-        )[..., 0].astype(np.float32) / 255.0
+        rgb_small_f32 = cv2.cvtColor(gray_small, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
+        l_small = cv2.cvtColor(rgb_small_f32, cv2.COLOR_RGB2LAB)[..., 0] / 100.0
 
         tensor = torch.from_numpy(l_small).unsqueeze(0).unsqueeze(0).to(self.device)
         with torch.inference_mode():
@@ -838,9 +836,8 @@ class ColorizationProcessor(VideoProcessorBase):
         ab = pred.squeeze(0).float().cpu().permute(1, 2, 0).numpy() * 128.0
         ab = cv2.resize(ab, (w, h), interpolation=cv2.INTER_CUBIC)
 
-        l_full = cv2.cvtColor(
-            cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB), cv2.COLOR_RGB2LAB
-        )[..., 0].astype(np.float32)
+        rgb_full_f32 = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
+        l_full = cv2.cvtColor(rgb_full_f32, cv2.COLOR_RGB2LAB)[..., 0]
         lab = np.empty((h, w, 3), dtype=np.float32)
         lab[..., 0] = l_full
         lab[..., 1:] = ab
@@ -852,7 +849,7 @@ class ColorizationProcessor(VideoProcessorBase):
             lab[..., 1] *= 1.18
             lab[..., 2] *= 1.18
         elif preset == "Cinema":
-            lab[..., 1] -= 3
+            lab[..., 1] -= 3.0
 
         if clamp:
             lab = apply_saturation_clamp(lab)
@@ -862,13 +859,11 @@ class ColorizationProcessor(VideoProcessorBase):
             for (x, y, fw, fh) in faces:
                 x, y, fw, fh = x * 2, y * 2, fw * 2, fh * 2
                 roi = lab[y:y + fh, x:x + fw]
-                roi[..., 1] = np.clip(roi[..., 1], 131, 150)
-                roi[..., 2] = np.clip(roi[..., 2], 136, 166)
+                roi[..., 1] = np.clip(roi[..., 1], 3.0, 22.0)
+                roi[..., 2] = np.clip(roi[..., 2], 8.0, 38.0)
 
-        colorized = cv2.cvtColor(
-            np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 255).astype(np.uint8),
-            cv2.COLOR_RGB2BGR,
-        )
+        rgb_out = (np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0.0, 1.0) * 255.0).astype(np.uint8)
+        colorized = cv2.cvtColor(rgb_out, cv2.COLOR_RGB2BGR)
         gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         if strength < 100:
             alpha = max(0.0, min(1.0, strength / 100.0))
@@ -1514,10 +1509,13 @@ elif active_page == "Video Studio":
                         colorize_video(model, video_path, silent_output, progress_callback=on_frame)
                         progress.progress(94, text="Finalizing MP4 container...")
                         if keep_audio and shutil.which("ffmpeg"):
-                            subprocess.run([
+                            res = subprocess.run([
                                 "ffmpeg", "-y", "-i", silent_output, "-i", video_path,
-                                "-c:v", "copy", "-c:a", "aac", "-shortest", final_output,
+                                "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0?",
+                                "-shortest", final_output,
                             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                            if res.returncode != 0 or not Path(final_output).exists():
+                                shutil.copyfile(silent_output, final_output)
                         else:
                             shutil.copyfile(silent_output, final_output)
                         progress.progress(100, text="Video rendering complete!")
