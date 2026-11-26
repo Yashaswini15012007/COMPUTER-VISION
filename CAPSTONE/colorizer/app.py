@@ -899,8 +899,19 @@ class ColorizationProcessor(VideoProcessorBase):
     def stop_recording(self):
         with self.lock:
             if self.record_writer is not None:
-                self.record_writer.release()
+                try:
+                    self.record_writer.release()
+                except Exception:
+                    pass
                 self.record_writer = None
+
+    def on_ended(self):
+        """Lifecycle hook called when the WebRTC media stream terminates."""
+        self.stop_recording()
+
+    def __del__(self):
+        """Ensure any allocated native video writer is freed on GC."""
+        self.stop_recording()
 
     def recv(self, frame):
         bgr = frame.to_ndarray(format="bgr24")
