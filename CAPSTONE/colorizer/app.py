@@ -1671,6 +1671,15 @@ elif active_page == "Live Webcam":
         )
 
     if model is not None and "pytest" not in sys.argv[0].lower():
+        # Capture current session state values safely on the Streamlit script thread
+        # (video_processor_factory is called inside a background worker thread where st.session_state is unavailable)
+        curr_face = bool(st.session_state.get("face_protection", False))
+        curr_clamp = bool(st.session_state.get("saturation_clamp", True))
+        curr_preset = str(st.session_state.get("preset", "Balanced"))
+        curr_bright = int(st.session_state.get("brightness_adj", 0))
+        curr_contrast = float(st.session_state.get("contrast_adj", 1.0))
+        curr_strength = int(st.session_state.get("processing_strength", 100))
+
         with cam_left:
             context = webrtc_streamer(
                 key="colorization-webcam",
@@ -1679,12 +1688,12 @@ elif active_page == "Live Webcam":
                     face_cascade,
                     resolution,
                     wipe,
-                    st.session_state.face_protection,
-                    st.session_state.saturation_clamp,
-                    st.session_state.preset,
-                    st.session_state.brightness_adj,
-                    st.session_state.contrast_adj,
-                    st.session_state.processing_strength,
+                    curr_face,
+                    curr_clamp,
+                    curr_preset,
+                    curr_bright,
+                    curr_contrast,
+                    curr_strength,
                 ),
                 media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
                 async_processing=True,
@@ -1693,12 +1702,12 @@ elif active_page == "Live Webcam":
             context.video_processor.update(
                 resolution,
                 wipe,
-                st.session_state.face_protection,
-                st.session_state.saturation_clamp,
-                st.session_state.preset,
-                st.session_state.brightness_adj,
-                st.session_state.contrast_adj,
-                st.session_state.processing_strength,
+                curr_face,
+                curr_clamp,
+                curr_preset,
+                curr_bright,
+                curr_contrast,
+                curr_strength,
             )
 
         with cam_right:
